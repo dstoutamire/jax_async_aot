@@ -4,11 +4,47 @@
 
 JAX's AOT (Ahead-of-Time) compiled functions appear to dispatch synchronously, while `@jit` decorated functions dispatch asynchronously. This is a showstopper for performance-critical applications that need to overlap computation with other work.
 
-## Key Finding
+## Key Findings
 
-After thorough investigation of the JAX codebase, we discovered:
+After thorough investigation of the JAX codebase and XLA internals, we discovered **two separate causes** of synchronous dispatch:
 
-**Pure AOT functions are already async!** The synchronous behavior only occurs when functions have **effects**.
+### 1. Effects (Host Callbacks, Debug Prints)
+
+**Pure AOT functions are already async!** The synchronous behavior occurs when functions have **effects** (see details below).
+
+### 2. While Loops with Dynamic Bounds (MAJOR)
+
+XLA's `WhileThunk` (`xla/backends/gpu/runtime/while_thunk.cc:164-171`) calls `stream.BlockHostUntilDone()` on every iteration when the loop has dynamic bounds. The host must read the condition result back from GPU to decide whether to continue.
+
+**This affects:** Any `jax.lax.while_loop`, `jaxopt.LBFGS`, and other iterative algorithms.
+
+**Solution:** CUDA 12.3+ supports conditional nodes in CUDA graphs, enabling on-device control flow without CPU round-trips. XLA implements this as `WhileCmd` in command buffers.
+
+**Enable with:**
+```bash
+export XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1"
+```
+
+#### XLA Bug Fix Required (JAX < 0.8.3)
+
+A bug in XLA's `cuda_command_buffer.cc` causes crashes when using command buffers with while loops. In `CreateConditionalNode`, the nested command buffer's `parent_` pointer is never set, causing a null pointer dereference on the second execution.
+
+**Status:** Fixed in `../xla_repo` (local build). The fix sets `nested_buffer->parent_ = this;` in `CreateConditionalNode`.
+
+#### CUDA Version Requirements
+
+| Loop Type | CUDA 12.8 | CUDA 12.9+ |
+|-----------|-----------|------------|
+| Dynamic-bound while loops | Works | Works |
+| Static-bound loops (unrolled) | Crashes | Works |
+| Nested while loops | Crashes | Works |
+| jaxopt L-BFGS | Crashes | **Works** |
+
+**Recommendation:** Use CUDA 12.9+ with the patched XLA for full async support.
+
+---
+
+## Effects-Based Sync (Original Finding)
 
 ### Test Results (1000x1000 matrix, CUDA)
 
@@ -172,6 +208,8 @@ result.block_until_ready()
 | `test_async_aot.py` | Basic functionality and timing tests |
 | `test_dispatch_path.py` | Tests which dispatch path (C++ vs Python) is used |
 | `test_effects_comparison.py` | Timing comparison between pure and effectful functions |
+| `bench_command_buffer.py` | Benchmark: while loop performance with command buffers |
+| `bench_async_pipeline.py` | Benchmark: async dispatch pipelining scalability |
 
 ## Running the Tests
 
@@ -180,6 +218,31 @@ cd /home/dps/jax_async_aot
 python3 test_async_aot.py
 python3 test_dispatch_path.py
 python3 test_effects_comparison.py
+```
+
+## Running the Benchmarks
+
+### Command Buffer Performance (While Loops)
+
+Compare while loop performance with and without command buffers:
+
+```bash
+# Without command buffers (baseline - sync, ~90% dispatch ratio)
+python3 bench_command_buffer.py
+
+# With command buffers (async, ~20% dispatch ratio)
+XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1" \
+    python3 bench_command_buffer.py
+```
+
+### Async Pipeline Scaling
+
+Demonstrate async dispatch by pipelining multiple operations:
+
+```bash
+# Should show ~1.5x speedup with pipelining when async works
+XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1" \
+    python3 bench_async_pipeline.py
 ```
 
 ## Key Source Files in JAX
@@ -218,16 +281,42 @@ The Python fallback path in `ExecuteReplicated.__call__` still calls `execute_sh
 
 ## Conclusion
 
-The "AOT is sync" issue is actually "**effectful AOT is sync**".
+The "AOT is sync" issue has **two root causes**:
 
+### 1. Effects-Based Sync
 - **Pure functions**: Already async, no workaround needed
 - **Effectful functions**: Inherently sync due to effect handling
 
-If you're seeing sync behavior, run `check_async_compatible()` to identify the cause:
+If you're seeing sync behavior, run `check_async_compatible()` to identify effect-based causes:
 
 ```python
 from async_aot import check_async_compatible
 info = check_async_compatible(compiled)
 if not info['compatible']:
     print(f"Sync due to: {info['issues']}")
+```
+
+### 2. While Loop Sync (Fixable!)
+
+For while loops, enable command buffers and use CUDA 12.9+:
+
+```bash
+export XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1"
+```
+
+**Expected improvements with command buffers:**
+
+| Test | Without | With | Improvement |
+|------|---------|------|-------------|
+| while_loop dispatch ratio | ~90% | ~20% | 4-5x faster dispatch |
+| L-BFGS dispatch ratio | ~90% | ~17% | 5x faster dispatch |
+| Pipeline throughput (8 ops) | 1.0x | 1.5-1.7x | 50-70% more throughput |
+
+With async dispatch working, you can pipeline multiple operations:
+
+```python
+# Launch multiple while-loop computations
+futures = [compiled(x) for x in batch]
+# All dispatched before first one completes!
+results = [f.block_until_ready() for f in futures]
 ```
