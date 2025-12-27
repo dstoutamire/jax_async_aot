@@ -50,7 +50,17 @@ export XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla
 | Nested while loops | Crashes | Works |
 | jaxopt L-BFGS | Crashes | Works |
 
-**XLA Bug Fix:** Versions before JAX 0.8.3 have a bug in `cuda_command_buffer.cc` where `CreateConditionalNode` fails to set the `parent_` pointer on nested command buffers, causing crashes on the second execution. This is fixed in our local XLA build (`../xla_repo`).
+**XLA Bug Fix Required:** Versions before the fix have a bug in `cuda_command_buffer.cc` where `CreateConditionalNode` fails to set the `parent_` pointer on nested command buffers, causing crashes on the second execution of while loops with command buffers enabled.
+
+- **Upstream PR:** https://github.com/openxla/xla/pull/35760
+- **Local fix:** Applied in `../xla_repo`
+
+The bug was introduced when PR #30036 added `parent_` pointer tracking for command buffers but only fixed `CreateChildNode`, missing `CreateConditionalNode`. The crash manifests as:
+```
+graph_exec_ is nullptr for top level cuda command buffer
+```
+
+Once the PR is merged, JAX releases built from that XLA version will include the fix.
 
 ### Performance Results
 
