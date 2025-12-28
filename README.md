@@ -1,47 +1,170 @@
-# JAX Async AOT Dispatch Investigation
+# JAX Async AOT Dispatch
 
-## Problem
+Tools and techniques for ensuring async GPU dispatch in JAX's AOT (Ahead-of-Time) compiled functions.
 
-JAX's AOT (Ahead-of-Time) compiled functions can dispatch synchronously, blocking until GPU computation completes. This prevents overlapping computation with other work—a showstopper for performance-critical applications.
+## The Problem
 
-After investigating JAX and XLA internals, we found **two distinct causes** of synchronous dispatch, each with different solutions.
+JAX's AOT compiled functions can dispatch synchronously, blocking until GPU computation completes. This prevents overlapping computation with other work - a showstopper for performance-critical applications.
+
+**Two distinct causes require different solutions:**
+
+| Cause | Symptom | Solution |
+|-------|---------|----------|
+| While loops with dynamic bounds | ~90% dispatch ratio | XLA command buffers |
+| Host effects (debug.print, callbacks) | Falls back to Python path | Remove effects from hot path |
 
 ## Quick Start
 
-For while loops (the most common cause), enable XLA command buffers:
+Enable XLA command buffers before importing JAX:
 
 ```bash
 export XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1"
 ```
 
-This reduces dispatch ratio from ~90% to ~20%, enabling async execution and 1.5x+ throughput improvements through pipelining.
+This reduces while loop dispatch ratio from ~90% to ~20%, enabling async execution.
 
-## Root Cause 1: While Loops with Dynamic Bounds
+## Compile-Time Verification
 
-This is the **major cause** of sync dispatch in practice. XLA's `WhileThunk` calls `stream.BlockHostUntilDone()` on every loop iteration when bounds are dynamic. The host must read the loop condition back from GPU memory to decide whether to continue—forcing a sync on each iteration.
+The most reliable way to verify async compatibility is to parse XLA's thunk dumps during compilation. This definitively shows whether control flow is captured into command buffers.
 
-**Affected operations:** `jax.lax.while_loop`, `jaxopt.LBFGS`, and any iterative algorithm with a data-dependent termination condition.
+### How It Works
 
-### The Solution: CUDA Graph Command Buffers
+When XLA compiles a JAX function, it generates "thunks" - executable operations. Control flow can appear as:
 
-CUDA 12.3+ introduced conditional nodes in CUDA graphs, enabling on-device control flow without CPU round-trips. XLA implements this through command buffers, controlled by `XLA_FLAGS`:
+- **Top-level thunks**: SYNCHRONOUS - CPU must check loop conditions each iteration
+- **Captured in command buffers**: ASYNC - GPU handles everything without CPU round-trips
+
+The `compile_aot.py` module parses thunk dumps to verify all control flow is captured.
+
+### Usage
+
+```python
+from compile_aot import compile_aot, load_aot
+import jax.numpy as jnp
+
+def my_optimization(x0):
+    # ... contains while loops, conditionals ...
+    return result
+
+# Compile with async verification
+compiled = compile_aot(
+    my_optimization,
+    example_args=(jnp.zeros(3),),
+    output_path="model.zst",  # optional: save to file
+    check_async=True,         # verify async compatibility
+)
+
+# Use immediately or load later
+result = compiled(jnp.zeros(3))
+# or
+loaded = load_aot("model.zst")
+result = loaded(jnp.zeros(3))
+```
+
+### CLI
+
+```bash
+# Compile example function
+python compile_aot.py example_fn:optimize --output model.zst
+
+# Skip async check (not recommended)
+python compile_aot.py example_fn:optimize --no-check
+```
+
+### What the Output Means
+
+```
+Compiling optimize...
+  Lowering and compiling...
+  Checking async dispatch compatibility...
+  Async dispatch check PASSED - all control flow captured in command buffers
+    Command buffers: 2
+    Captured while loops: 1
+    Captured conditionals: 0
+  Serializing executable...
+  Compressing with zstd (level 3)...
+Successfully compiled to model.zst
+```
+
+If verification fails:
+
+```
+ASYNC DISPATCH CHECK FAILED
+Found 1 SYNC while loop(s) at top level
+This means CPU-GPU synchronization will occur during execution.
+```
+
+## Thunk Sequence Analysis
+
+For debugging, you can inspect thunk sequences directly:
+
+```python
+from compile_aot import run_with_thunk_dump, parse_thunk_sequence
+
+script = '''
+import jax
+import jax.numpy as jnp
+
+@jax.jit
+def my_fn(x):
+    def cond(state):
+        i, _ = state
+        return i < 10
+    def body(state):
+        i, x = state
+        return (i + 1, x + 1.0)
+    _, result = jax.lax.while_loop(cond, body, (0, x))
+    return result
+
+result = my_fn(jnp.array(0.0))
+result.block_until_ready()
+'''
+
+thunk_text = run_with_thunk_dump(script)
+parsed = parse_thunk_sequence(thunk_text)
+
+print(f"Command buffers: {len(parsed['command_buffers'])}")
+print(f"Captured while loops: {len(parsed['captured_whiles'])}")
+print(f"Top-level (SYNC) while loops: {len(parsed['top_level_whiles'])}")
+```
+
+### Example Thunk Sequence
+
+**Good (async)** - while loop inside command buffer:
+```
+0 kCommandBuffer command_buffer.1
+  1 kWhile while.1
+    2 kFusion fusion.body
+```
+
+**Bad (sync)** - while loop at top level:
+```
+0 kWhile while.1
+  1 kFusion fusion.body
+```
+
+## Root Cause 1: While Loops
+
+XLA's `WhileThunk` calls `stream.BlockHostUntilDone()` on every loop iteration when bounds are dynamic. The host must read the loop condition back from GPU to decide whether to continue.
+
+### Solution: CUDA Graph Command Buffers
+
+CUDA 12.3+ introduced conditional nodes in CUDA graphs. XLA's command buffers use these to execute loops entirely on GPU:
 
 ```bash
 export XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1"
 ```
-
-**What each flag does:**
 
 | Flag | Purpose |
 |------|---------|
-| `FUSION` | Captures fused operations (matmul, elementwise ops) into CUDA graphs for reduced kernel launch overhead |
-| `CONDITIONAL` | Enables `lax.cond` and `lax.switch` to execute entirely on GPU using CUDA graph conditional nodes |
-| `WHILE` | Enables `lax.while_loop` to execute entirely on GPU using CUDA graph while-loop nodes—the key fix for async dispatch |
-| `graph_min_graph_size=1` | Captures even small operations into graphs (default threshold is higher, which can miss simple loops) |
+| `FUSION` | Captures fused operations into CUDA graphs |
+| `CONDITIONAL` | Enables `lax.cond` on GPU via graph conditional nodes |
+| `WHILE` | Enables `lax.while_loop` on GPU via graph while-loop nodes |
+| `graph_min_graph_size=1` | Captures even small operations (default threshold is higher) |
 
 ### Requirements
 
-**CUDA 12.9+** is required for full support. Earlier versions have limitations:
+**CUDA 12.9+** is required for full support:
 
 | Pattern | CUDA 12.8 | CUDA 12.9+ |
 |---------|-----------|------------|
@@ -50,48 +173,21 @@ export XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla
 | Nested while loops | Crashes | Works |
 | jaxopt L-BFGS | Crashes | Works |
 
-**XLA Bug Fix Required:** Versions before the fix have a bug in `cuda_command_buffer.cc` where `CreateConditionalNode` fails to set the `parent_` pointer on nested command buffers, causing crashes on the second execution of while loops with command buffers enabled.
+**XLA Bug Fix Required:** Versions before PR #35760 have a bug where `CreateConditionalNode` fails to set the `parent_` pointer on nested command buffers.
 
 - **Upstream PR:** https://github.com/openxla/xla/pull/35760
-- **Local fix:** Applied in `../xla_repo`
-
-The bug was introduced when PR #30036 added `parent_` pointer tracking for command buffers but only fixed `CreateChildNode`, missing `CreateConditionalNode`. The crash manifests as:
-```
-graph_exec_ is nullptr for top level cuda command buffer
-```
-
-Once the PR is merged, JAX releases built from that XLA version will include the fix.
-
-### Performance Results
-
-| Metric | Without Command Buffers | With Command Buffers |
-|--------|------------------------|---------------------|
-| While loop dispatch ratio | ~90% (sync) | ~20% (async) |
-| L-BFGS dispatch ratio | ~90% | ~17% |
-| Pipeline throughput (8 ops) | 1.0x | 1.5-1.7x |
-
-With async dispatch, you can pipeline multiple operations:
-
-```python
-# Launch all operations (returns immediately with async handles)
-futures = [compiled(x) for x in batch]
-# GPU executes while CPU prepares next batch
-results = [f.block_until_ready() for f in futures]
-```
 
 ## Root Cause 2: Host Effects
 
-Pure AOT functions are already async. Sync behavior occurs when functions have **effects** that require host interaction: `jax.debug.print`, `jax.pure_callback`, `jax.experimental.io_callback`, etc.
-
-When effects are present, JAX falls back to a Python dispatch path that handles effect tokens synchronously. This is inherent to how effects work—they require coordination with the host.
+Functions with effects (`jax.debug.print`, `jax.pure_callback`, etc.) fall back to a Python dispatch path that handles effect tokens synchronously.
 
 | Function Type | Dispatch Ratio | Behavior |
 |--------------|----------------|----------|
-| Pure function | ~38% | Async |
+| Pure function | ~20-38% | Async |
 | With `jax.pure_callback` | ~98% | Sync |
 | With `jax.debug.print` | ~96% | Sync |
 
-### Checking Your Function
+### Checking for Effects
 
 ```python
 from async_aot import check_async_compatible
@@ -103,46 +199,71 @@ if not info['compatible']:
     print(f"Sync due to: {info['issues']}")
 ```
 
-### Solutions for Effectful Functions
+### Solutions
 
-**Remove effects in production:** Keep debug prints in a separate development version.
-
-**Separate effectful and pure parts:** Move effects outside the compiled function:
-
+**Remove effects in production:**
 ```python
-# Instead of printing inside the function...
+# Keep debug prints in development version only
 compiled = jax.jit(pure_compute).lower(x).compile()
 result = compiled(x)  # Async!
 print(f"result: {result}")  # Print after, outside JAX
 ```
 
-## Running the Benchmarks
+## Performance Results
 
-```bash
-cd /home/dps/jax_async_aot
-source venv/bin/activate
+| Metric | Without Command Buffers | With Command Buffers |
+|--------|------------------------|---------------------|
+| While loop dispatch ratio | ~90% (sync) | ~20% (async) |
+| L-BFGS dispatch ratio | ~90% | ~17% |
+| Pipeline throughput (8 ops) | 1.0x | 1.5-1.7x |
 
-# Command buffer benchmark (while loop dispatch ratio)
-python3 bench_command_buffer.py  # Baseline: ~90% ratio
+With async dispatch, you can pipeline operations:
 
-XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1" \
-    python3 bench_command_buffer.py  # With fix: ~20% ratio
-
-# Pipelining benchmark (throughput scaling)
-XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1" \
-    python3 bench_async_pipeline.py  # Shows 1.5x speedup with 8 ops
+```python
+# Launch all (returns immediately with async handles)
+futures = [compiled(x) for x in batch]
+# GPU executes while CPU prepares next batch
+results = [f.block_until_ready() for f in futures]
 ```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `async_aot.py` | Compatibility checker and workaround utilities |
+| `compile_aot.py` | **AOT compilation with async verification** - thunk parsing, serialize/compress |
+| `async_aot.py` | Runtime compatibility checking (effects inspection) |
+| `example_fn.py` | Example functions for testing (L-BFGS, while loops, conditionals) |
+| `test_compile_aot.py` | Tests for compile-time async verification |
 | `bench_command_buffer.py` | While loop dispatch ratio benchmark |
 | `bench_async_pipeline.py` | Pipelining throughput benchmark |
-| `test_*.py` | Unit tests for dispatch path behavior |
+
+## Running Tests
+
+```bash
+# All tests
+pytest -v
+
+# Compile-time verification tests
+pytest test_compile_aot.py -v
+
+# Benchmarks
+XLA_FLAGS="--xla_gpu_enable_command_buffer=FUSION,CONDITIONAL,WHILE --xla_gpu_graph_min_graph_size=1" \
+    python bench_command_buffer.py
+```
 
 ## Technical Deep Dive
+
+### XLA Thunk Types
+
+| Thunk | Behavior | Async Compatible |
+|-------|----------|------------------|
+| `kFusion` | Fused kernel launch | Yes |
+| `kWhile` (top-level) | CPU checks condition each iteration | No |
+| `kWhile` (in command buffer) | GPU evaluates condition | Yes |
+| `kConditional` (top-level) | CPU selects branch | No |
+| `kConditional` (in command buffer) | GPU selects branch | Yes |
+| `kCommandBuffer` | CUDA graph container | Yes |
+| `kFft` | FFT operation | No (not yet supported) |
 
 ### Dispatch Path Decision
 
@@ -158,22 +279,12 @@ def __call__(self, *args, **kwargs):
     return self._call(*args, **kwargs)
 ```
 
-The C++ fastpath (`jaxlib/pjit.cc`) releases the GIL and returns immediately with async array handles. The Python fallback holds the GIL longer and processes effect tokens synchronously.
-
-### Why Command Buffers Fix While Loops
-
-Without command buffers, XLA's `WhileThunk` executes:
-1. Run loop body on GPU
-2. Copy condition result to CPU (`BlockHostUntilDone`)
-3. Check condition on CPU
-4. Repeat
-
-With command buffers (`WhileCmd`), the entire loop is captured as a CUDA graph with conditional nodes. The GPU evaluates the condition and branches without CPU involvement. The host dispatches the graph once and returns immediately.
+The C++ fastpath releases the GIL and returns immediately with async array handles.
 
 ### Key XLA Source Files
 
 | File | Purpose |
 |------|---------|
-| `xla/backends/gpu/runtime/while_thunk.cc` | Standard while loop execution (sync) |
+| `xla/backends/gpu/runtime/while_thunk.cc` | Standard while loop (sync) |
 | `xla/backends/gpu/runtime/command_buffer_cmd.cc` | `WhileCmd` implementation (async) |
-| `xla/stream_executor/cuda/cuda_command_buffer.cc` | CUDA graph creation, including the `parent_` bug fix |
+| `xla/stream_executor/cuda/cuda_command_buffer.cc` | CUDA graph creation |
